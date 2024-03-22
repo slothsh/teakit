@@ -22,7 +22,10 @@ if __name__ == "__main__":
         author_email=AUTHOR_EMAIL,
         description=PROJECT_DESCRIPTION,
         url=PROJECT_URL,
-        packages=find_packages(),
+        packages=["teakit"],
+        package_dir={
+            "teakit": "src",
+        },
         classifiers=[
             "Programming Language :: Python :: 3",
             "License :: OSI Approved :: MIT License",
