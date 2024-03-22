@@ -32,6 +32,9 @@ if __name__ == "__main__":
             "Operating System :: OS Independent",
         ],
         python_requires='>=3.6',
+        install_requires=[
+            "termcolor >= 2.4.0",
+        ],
     )
 
 # --------------------------------------------------------------------------------
