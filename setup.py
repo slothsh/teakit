@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from setuptools import setup
+from setuptools import setup, find_packages
 import tomllib
 
 CONFIG = tomllib.load(open("./project.toml", "rb"))
@@ -22,9 +22,7 @@ if __name__ == "__main__":
         author_email=AUTHOR_EMAIL,
         description=PROJECT_DESCRIPTION,
         url=PROJECT_URL,
-        package_dir={
-            "": "src"
-        },
+        packages=find_packages(),
         classifiers=[
             "Programming Language :: Python :: 3",
             "License :: OSI Approved :: MIT License",
