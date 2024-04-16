@@ -7,4 +7,4 @@ description = "A quaint little build library suitable for a Sunday tea-break"
 [version]
 major = 0
 minor = 0
-sub = 0
+sub = 1

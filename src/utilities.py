@@ -1,3 +1,5 @@
+import dill
+from multiprocessing import Process
 from dataclasses import dataclass
 from typing import List, Any
 
@@ -20,5 +22,20 @@ def partition(data: List[Any], max_partitions: int) -> List[List[Any]]:
         partition_data[i % partitions].append(v)
 
     return partition_data
+
+# --------------------------------------------------------------------------------
+
+
+# Dill Process Utilities
+# --------------------------------------------------------------------------------
+
+class DillProcess(Process):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._target = dill.dumps(self._target)
+
+    def run(self):
+        if self._target:
+            self._target = dill.loads(self._target, ignore=False)
 
 # --------------------------------------------------------------------------------

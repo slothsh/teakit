@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from setuptools import setup, find_packages
+from setuptools import setup
 import tomllib
 
 CONFIG = tomllib.load(open("./project.toml", "rb"))
@@ -21,6 +21,7 @@ if __name__ == "__main__":
         author=PROJECT_AUTHOR,
         author_email=AUTHOR_EMAIL,
         description=PROJECT_DESCRIPTION,
+        version=VERSION,
         url=PROJECT_URL,
         packages=["teakit"],
         package_dir={
@@ -34,6 +35,7 @@ if __name__ == "__main__":
         python_requires='>=3.6',
         install_requires=[
             "termcolor >= 2.4.0",
+            "dill >= 0.3.8",
         ],
     )
 

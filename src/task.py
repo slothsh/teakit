@@ -1,10 +1,10 @@
 from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self
 from dataclasses import dataclass
-from enum import IntEnum, Enum
-from .logging import ERROR, INFO, WARN, SUCCESS, FAIL
+from enum import Enum
+from .logging import INFO, SUCCESS, FAIL
 from .logging import Result, StatusResult, Status
-from .utilities import partition
-from multiprocessing import Manager, Process
+from .utilities import partition, DillProcess
+from multiprocessing import Manager
 from multiprocessing.managers import ListProxy
 
 # Development Database Tasks
@@ -249,12 +249,12 @@ class TaskExecutor:
 
             for depth, node in enumerate(self.graph):
                 partitioned_tasks = partition(node.tasks, max_processes)
-                processes: List[Process] = []
+                processes: List[DillProcess] = []
                 shared_results: ListProxy[Tuple[int, int, Task, StatusResult]] = manager.list([])
 
                 for partition_i, part in enumerate(partitioned_tasks):
                     for process_i, task in enumerate(part):
-                        task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results))
+                        task_process = DillProcess(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results))
                         processes.append(task_process)
                         task_process.start()
                         task_process.join()
