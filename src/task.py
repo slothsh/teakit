@@ -3,8 +3,8 @@ from dataclasses import dataclass
 from enum import Enum
 from .logging import INFO, SUCCESS, FAIL
 from .logging import Result, StatusResult, Status
-from .utilities import partition, DillProcess
-from multiprocessing import Manager
+from .utilities import partition
+from multiprocessing import Manager, Process
 from multiprocessing.managers import ListProxy
 
 # Development Database Tasks
@@ -23,6 +23,11 @@ class TaskIdentifier(Enum):
     def task_context(identifier: Tuple[int, str]) -> str:
         return identifier[1]
 
+    @staticmethod
+    def get_value(identifier: Any | Tuple[int, str]):
+        if isinstance(identifier, tuple):
+            return identifier
+        return identifier.value
 
 class TaskLog(TypedDict):
     pending: List[TaskIdentifier]
@@ -38,9 +43,9 @@ class TaskLog(TypedDict):
 @dataclass
 class Task:
     action: Callable[..., StatusResult]
-    identifier: TaskIdentifier
+    identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
-    dependencies: List[TaskIdentifier] | None = None
+    dependencies: List[TaskIdentifier | Tuple[int, str]] | None = None
 
     def execute(self) -> StatusResult:
         try:
@@ -57,9 +62,13 @@ class Task:
         return True
 
     def id(self):
+        if isinstance(self.identifier, tuple):
+            return f"{TaskIdentifier.task_hash(self.identifier)}"
         return f"{TaskIdentifier.task_hash(self.identifier.value)}"
 
     def id_with_context(self):
+        if isinstance(self.identifier, tuple):
+            return f"{TaskIdentifier.task_id(self.identifier)}{f': {TaskIdentifier.task_context(self.identifier)}' if TaskIdentifier.task_context(self.identifier) != '' else ''}"
         return f"{TaskIdentifier.task_id(self.identifier.value)}{f': {TaskIdentifier.task_context(self.identifier.value)}' if TaskIdentifier.task_context(self.identifier.value) != '' else ''}"
 
 
@@ -144,7 +153,7 @@ class TaskGraph:
                                 depth = 0
                                 while depth <= root.total_depth():
                                     for _graph_depth, graph_task in root.tasks_at(depth):
-                                        if TaskIdentifier.task_hash(current_dependency.value) == TaskIdentifier.task_hash(graph_task.identifier.value):
+                                        if TaskIdentifier.task_hash(TaskIdentifier.get_value(current_dependency)) == TaskIdentifier.task_hash(TaskIdentifier.get_value(graph_task.identifier)):
                                             found += 1
                                             deepest = depth if deepest < depth else deepest
                                     depth += 1
@@ -249,12 +258,12 @@ class TaskExecutor:
 
             for depth, node in enumerate(self.graph):
                 partitioned_tasks = partition(node.tasks, max_processes)
-                processes: List[DillProcess] = []
+                processes: List[Process] = []
                 shared_results: ListProxy[Tuple[int, int, Task, StatusResult]] = manager.list([])
 
                 for partition_i, part in enumerate(partitioned_tasks):
                     for process_i, task in enumerate(part):
-                        task_process = DillProcess(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results))
+                        task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results))
                         processes.append(task_process)
                         task_process.start()
                         task_process.join()
