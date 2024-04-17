@@ -4,8 +4,10 @@ from enum import Enum
 from .logging import INFO, SUCCESS, FAIL
 from .logging import Result, StatusResult, Status
 from .utilities import partition
+from .resource import ForwardResourcesFrom
 from multiprocessing import Manager, Process
 from multiprocessing.managers import ListProxy
+from hashlib import sha256
 
 # Development Database Tasks
 # --------------------------------------------------------------------------------
@@ -13,7 +15,10 @@ from multiprocessing.managers import ListProxy
 class TaskIdentifier(Enum):
     @staticmethod
     def task_hash(identifier: Tuple[int, str]) -> int:
-        return hash(str(identifier[0]) + str(identifier[1]))
+        hasher = sha256()
+        hasher.update(bytes(identifier[0]))
+        hasher.update(bytes(identifier[1], "utf-8"))
+        return int.from_bytes(hasher.digest(), "big")
 
     @staticmethod
     def task_id(identifier: Tuple[int, str]) -> int:
@@ -42,17 +47,43 @@ class TaskLog(TypedDict):
 
 @dataclass
 class Task:
-    action: Callable[..., StatusResult]
+    action: Callable[..., Tuple[Any, StatusResult]]
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
     dependencies: List[TaskIdentifier | Tuple[int, str]] | None = None
+    outputs: Any | None = None
 
-    def execute(self) -> StatusResult:
+    def execute(self, resources: dict[int, Any] = {}) -> StatusResult:
         try:
-            result = self.action(*self.args)
+            normal_args, output_args_keys = self.get_resource_keys(*self.args)
+            valid_resources = []
+
+            for k in output_args_keys:
+                task_hash = TaskIdentifier.task_hash(k)
+                if task_hash not in resources:
+                    return StatusResult(Status.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(k)}: {TaskIdentifier.task_context(k)}\"")
+                valid_resources.append(resources[task_hash])
+
+            output, result = self.action(*normal_args, *valid_resources)
+
+            if result.status == Status.SUCCESS and output is not None:
+                self.outputs = output
             return result
         except Exception as error:
             return StatusResult(Status.FAIL, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
+
+    def get_resource_keys(self, *args) -> Tuple[List[Any], List[Tuple[int, str]]]:
+        all_args = [*args]
+        normal_args = []
+        resource_keys: List[Tuple[int, str]] = []
+        for i, a in enumerate(all_args):
+            if isinstance(a, ForwardResourcesFrom):
+                resource_keys.append(a.id)
+            else:
+                normal_args.append(a)
+
+        return normal_args, resource_keys
+
 
     def dependencies_satisified(self, completed_dependencies: List[TaskIdentifier]) -> bool:
         if self.dependencies is not None:
@@ -61,12 +92,17 @@ class Task:
                     return False
         return True
 
-    def id(self):
+    def id_as_str(self) -> str:
         if isinstance(self.identifier, tuple):
             return f"{TaskIdentifier.task_hash(self.identifier)}"
         return f"{TaskIdentifier.task_hash(self.identifier.value)}"
 
-    def id_with_context(self):
+    def id_as_int(self) -> int:
+        if isinstance(self.identifier, tuple):
+            return TaskIdentifier.task_hash(self.identifier)
+        return TaskIdentifier.task_hash(self.identifier.value)
+
+    def id_with_context(self) -> str:
         if isinstance(self.identifier, tuple):
             return f"{TaskIdentifier.task_id(self.identifier)}{f': {TaskIdentifier.task_context(self.identifier)}' if TaskIdentifier.task_context(self.identifier) != '' else ''}"
         return f"{TaskIdentifier.task_id(self.identifier.value)}{f': {TaskIdentifier.task_context(self.identifier.value)}' if TaskIdentifier.task_context(self.identifier.value) != '' else ''}"
@@ -240,15 +276,16 @@ class TaskExecutorResults(TypedDict):
 class TaskExecutor:
     def __init__(self, graph: TaskGraph):
         self.graph: TaskGraph = graph
+        self.outputs: dict[int, Any] = {}
         self.results: TaskExecutorResults = {
             "success": [],
             "failed": []
         }
         
     @staticmethod
-    def task_process(task: Task, partition_i: int, process_i: int, shared_results):
+    def task_process(task: Task, partition_i: int, process_i: int, shared_results, resources: dict[int, Any]):
         try:
-            result = task.execute()
+            result = task.execute(resources)
             shared_results.append((partition_i, process_i, task, result))
         except Exception as error:
             shared_results.append((partition_i, process_i, task, StatusResult(Status.FAIL, str(error))))
@@ -263,10 +300,9 @@ class TaskExecutor:
 
                 for partition_i, part in enumerate(partitioned_tasks):
                     for process_i, task in enumerate(part):
-                        task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results))
+                        task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs))
                         processes.append(task_process)
                         task_process.start()
-                        task_process.join()
 
                 print(INFO, f"executing {len(processes)} task{'' if len(processes) == 1 else 's'} in layer {depth} of task graph")
 
@@ -276,9 +312,14 @@ class TaskExecutor:
                 else:
                     for partition_i, process_i, task, result in shared_results:
                         if result.status == Status.SUCCESS:
+                            if task.outputs is not None:
+                                self.outputs[task.id_as_int()] = task.outputs
                             print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
                         elif result.status == Status.FAIL:
                             print(FAIL, result.message)
+
+                for p in processes:
+                    p.join()
 
     def insert_result(self, result: TaskExecutorResultEntry):
         if result[3].status == Status.SUCCESS:
