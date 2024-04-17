@@ -16,7 +16,7 @@ class TaskIdentifier(Enum):
     @staticmethod
     def task_hash(identifier: Tuple[int, str]) -> int:
         hasher = sha256()
-        hasher.update(bytes(identifier[0]))
+        hasher.update(identifier[0].to_bytes(identifier[0].bit_length() + 7 // 8, "big"))
         hasher.update(bytes(identifier[1], "utf-8"))
         return int.from_bytes(hasher.digest(), "big")
 
