@@ -1,4 +1,4 @@
-from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self
+from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self, Set
 from dataclasses import dataclass
 from enum import Enum
 from .logging import INFO, SUCCESS, FAIL
@@ -50,21 +50,18 @@ class Task:
     action: Callable[..., Tuple[Any, StatusResult]]
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
-    dependencies: List[TaskIdentifier | Tuple[int, str]] | None = None
+    dependencies: Set[TaskIdentifier | Tuple[int, str]] | None = None
     outputs: Any | None = None
+
+    def __post_init__(self):
+        self.resolve_dependencies()
 
     def execute(self, resources: dict[int, Any] = {}) -> StatusResult:
         try:
-            normal_args, output_args_keys = self.get_resource_keys(*self.args)
-            valid_resources = []
-
-            for k in output_args_keys:
-                task_hash = TaskIdentifier.task_hash(k)
-                if task_hash not in resources:
-                    return StatusResult(Status.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(k)}: {TaskIdentifier.task_context(k)}\"")
-                valid_resources.append(resources[task_hash])
-
-            output, result = self.action(*normal_args, *valid_resources)
+            resolved_arguments, resolved_status = self.resolve_arguments(resources).unwrap_both()
+            if resolved_status is not None:
+                return resolved_status
+            output, result = self.action(*resolved_arguments)
 
             if result.status == Status.SUCCESS and output is not None:
                 self.outputs = output
@@ -72,18 +69,28 @@ class Task:
         except Exception as error:
             return StatusResult(Status.FAIL, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
 
-    def get_resource_keys(self, *args) -> Tuple[List[Any], List[Tuple[int, str]]]:
-        all_args = [*args]
-        normal_args = []
-        resource_keys: List[Tuple[int, str]] = []
+    def resolve_arguments(self, resources: dict[int, Any]) -> Result[List[Any], StatusResult]:
+        all_args = [*self.args]
+        resolved: List[Any] = []
         for i, a in enumerate(all_args):
             if isinstance(a, ForwardResourcesFrom):
-                resource_keys.append(a.id)
+                task_hash = TaskIdentifier.task_hash(a.id)
+                if task_hash not in resources:
+                    return Result(None, StatusResult(Status.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(a.id)}: {TaskIdentifier.task_context(a.id)}\""))
+                resolved.append(resources[task_hash])
             else:
-                normal_args.append(a)
+                resolved.append(a)
 
-        return normal_args, resource_keys
+        return Result(resolved, None)
 
+    def resolve_dependencies(self) -> StatusResult:
+        all_args = [*self.args]
+        for i, a in enumerate(all_args):
+            if isinstance(a, ForwardResourcesFrom):
+                if self.dependencies is None:
+                    self.dependencies = set({})
+                self.dependencies.add(a.id)
+        return StatusResult(Status.SUCCESS, "")
 
     def dependencies_satisified(self, completed_dependencies: List[TaskIdentifier]) -> bool:
         if self.dependencies is not None:
@@ -161,7 +168,7 @@ class TaskGraph:
 
     @classmethod
     def from_tasks(cls, tasks: List[Task]) -> Result[Self, StatusResult]:
-        root = TaskGraph([])
+        root = cls([])
 
         # Find independent tasks and insert at root
         offset = 0
@@ -232,7 +239,7 @@ class TaskGraph:
             self.tasks.append(value)
         elif self.depth < depth and self.next is None:
             self.next = TaskGraph([value], depth=self.depth + 1)
-        else:
+        elif self.next is not None:
             self.next.insert_at(value, depth)
 
     def total_depth(self):
@@ -275,6 +282,7 @@ class TaskExecutorResults(TypedDict):
 
 class TaskExecutor:
     def __init__(self, graph: TaskGraph):
+        self.manager = Manager()
         self.graph: TaskGraph = graph
         self.outputs: dict[int, Any] = {}
         self.results: TaskExecutorResults = {
@@ -290,36 +298,43 @@ class TaskExecutor:
         except Exception as error:
             shared_results.append((partition_i, process_i, task, StatusResult(Status.FAIL, str(error))))
 
+    @classmethod
+    def from_tasks(cls, tasks: List[Task]) -> Result[Self, StatusResult]:
+        graph, graph_result = TaskGraph.from_tasks(tasks).unwrap_both()
+        if graph_result is not None:
+            return Result(None, StatusResult(graph_result.status, graph_result.message))
+        if graph is not None:
+            return Result(cls(graph), None)
+        return Result(None, StatusResult(Status.ERROR, "<TaskExecutor: failed to construct graph with provided tasks>"))
+
     def execute(self, max_processes: int = 1):
-        with Manager() as manager:
+        for depth, node in enumerate(self.graph):
+            partitioned_tasks = partition(node.tasks, max_processes)
+            processes: List[Process] = []
+            shared_results: ListProxy[Tuple[int, int, Task, StatusResult]] = self.manager.list([])
 
-            for depth, node in enumerate(self.graph):
-                partitioned_tasks = partition(node.tasks, max_processes)
-                processes: List[Process] = []
-                shared_results: ListProxy[Tuple[int, int, Task, StatusResult]] = manager.list([])
+            for partition_i, part in enumerate(partitioned_tasks):
+                for process_i, task in enumerate(part):
+                    task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs))
+                    processes.append(task_process)
+                    task_process.start()
 
-                for partition_i, part in enumerate(partitioned_tasks):
-                    for process_i, task in enumerate(part):
-                        task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs))
-                        processes.append(task_process)
-                        task_process.start()
+            print(INFO, f"executing {len(processes)} task{'' if len(processes) == 1 else 's'} in layer {depth} of task graph")
 
-                print(INFO, f"executing {len(processes)} task{'' if len(processes) == 1 else 's'} in layer {depth} of task graph")
+            while None in [p.exitcode for i, p in enumerate(processes)]:
+                # TODO: Report Progress
+                pass
+            else:
+                for partition_i, process_i, task, result in shared_results:
+                    if result.status == Status.SUCCESS:
+                        if task.outputs is not None:
+                            self.outputs[task.id_as_int()] = task.outputs
+                        print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
+                    elif result.status == Status.FAIL:
+                        print(FAIL, result.message)
 
-                while None in [p.exitcode for i, p in enumerate(processes)]:
-                    # TODO: Report Progress
-                    pass
-                else:
-                    for partition_i, process_i, task, result in shared_results:
-                        if result.status == Status.SUCCESS:
-                            if task.outputs is not None:
-                                self.outputs[task.id_as_int()] = task.outputs
-                            print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
-                        elif result.status == Status.FAIL:
-                            print(FAIL, result.message)
-
-                for p in processes:
-                    p.join()
+            for p in processes:
+                p.join()
 
     def insert_result(self, result: TaskExecutorResultEntry):
         if result[3].status == Status.SUCCESS:
