@@ -5,10 +5,12 @@ from .logging import INFO, SUCCESS, FAIL
 from .logging import Status, StatusKind
 from .result import Result, Ok, Err
 from .utilities import partition
-from .resource import ForwardResourcesFrom
 from multiprocessing import Manager, Process
 from multiprocessing.managers import ListProxy
 from hashlib import sha256
+
+
+# --------------------------------------------------------------------------------
 
 # Development Database Tasks
 # --------------------------------------------------------------------------------
@@ -76,10 +78,13 @@ class Task:
         all_args = [*self.args]
         resolved: List[Any] = []
         for i, a in enumerate(all_args):
-            if isinstance(a, ForwardResourcesFrom):
-                task_hash = TaskIdentifier.task_hash(a.id)
+            if isinstance(a, OutputFrom):
+                task_value = TaskIdentifier.get_value(a.id)
+                task_hash = TaskIdentifier.task_hash(task_value)
                 if task_hash not in resources:
-                    return Err(Status(StatusKind.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(a.id)}: {TaskIdentifier.task_context(a.id)}\""))
+                    id = TaskIdentifier.task_id(task_value)
+                    context = TaskIdentifier.task_context(task_value)
+                    return Err(Status(StatusKind.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{id}: {context}\""))
                 resolved.append(resources[task_hash])
             else:
                 resolved.append(a)
@@ -89,7 +94,7 @@ class Task:
     def resolve_dependencies(self) -> Status:
         all_args = [*self.args]
         for i, a in enumerate(all_args):
-            if isinstance(a, ForwardResourcesFrom):
+            if isinstance(a, OutputFrom):
                 if self.dependencies is None:
                     self.dependencies = set({})
                 self.dependencies.add(a.id)
@@ -133,6 +138,11 @@ def TaskExecutionWrapper(task: Task, after: Callable[..., None]):
             return result
 
     return execute
+
+
+@dataclass
+class OutputFrom:
+        id: TaskIdentifier | Tuple[int, str]
 
 # --------------------------------------------------------------------------------
 
