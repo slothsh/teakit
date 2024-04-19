@@ -1,7 +1,6 @@
 from termcolor import colored
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TypeVar, Generic, Tuple, List, Any
 from pathlib import Path
 
 # Logging Utilities
@@ -30,7 +29,7 @@ class SourceFileInfo:
 
 @dataclass
 class Status:
-    status: StatusKind
+    kind: StatusKind
     message: str = ""
 
 # --------------------------------------------------------------------------------

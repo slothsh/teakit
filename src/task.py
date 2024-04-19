@@ -1,18 +1,15 @@
+from queue import Empty
 from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self, Set
 from dataclasses import dataclass
 from enum import Enum
-from .logging import INFO, SUCCESS, FAIL
 from .logging import Status, StatusKind
 from .result import Result, Ok, Err
 from .utilities import partition
-from multiprocessing import Manager, Process
-from multiprocessing.managers import ListProxy
+from multiprocessing import Manager, Process, Queue
+from multiprocessing.managers import DictProxy, ListProxy
 from hashlib import sha256
 
-
-# --------------------------------------------------------------------------------
-
-# Development Database Tasks
+# Task Utilities
 # --------------------------------------------------------------------------------
 
 class TaskIdentifier(Enum):
@@ -42,6 +39,16 @@ class TaskLog(TypedDict):
     failed: List[TaskIdentifier]
     completed: List[TaskIdentifier]
 
+
+@dataclass
+class TaskMessenger:
+    signature: int
+    queue: Queue
+
+    def send_progress(self, progress: float) -> Status:
+        self.queue.put((self.signature, progress))
+        return Status(StatusKind.SUCCESS, "")
+
 # --------------------------------------------------------------------------------
 
 
@@ -59,13 +66,13 @@ class Task:
     def __post_init__(self):
         self.resolve_dependencies()
 
-    def execute(self, resources: dict[int, Any] = {}) -> Status:
+    def execute(self, messenger: TaskMessenger, resources: dict[int, Any] = {}) -> Status:
         try:
             resolved_result = self.resolve_arguments(resources)
             match resolved_result:
                 case Ok(resolved_arguments):
-                    output, result = self.action(*resolved_arguments)
-                    if result.status == StatusKind.SUCCESS and output is not None:
+                    output, result = self.action(messenger, *resolved_arguments)
+                    if result.kind == StatusKind.SUCCESS and output is not None:
                         self.outputs = output
                     return result
                 case Err(error):
@@ -126,45 +133,9 @@ class Task:
 # Task Utilities
 # --------------------------------------------------------------------------------
 
-def TaskExecutionWrapper(task: Task, after: Callable[..., None]):
-    def execute() -> Status:
-        try:
-            result = task.execute()
-            after(result)
-            return result
-        except Exception as error:
-            result = Status(StatusKind.FAIL, f"failed to execute step during {TaskGroup.__name__} execution with error: {error}")
-            after(result)
-            return result
-
-    return execute
-
-
 @dataclass
 class OutputFrom:
         id: TaskIdentifier | Tuple[int, str]
-
-# --------------------------------------------------------------------------------
-
-
-# Task Group Object
-# --------------------------------------------------------------------------------
-
-class TaskGroup:
-    def __init__(self, tasks: List[Task]):
-        self.name: str
-        self.tasks: List[Task] = tasks
-
-    def __iter__(self):
-        return iter(self.tasks)
-
-    def group_name(self) -> str:
-        return self.name
-
-    def add_task(self, task: Task):
-        if isinstance(task, Task) is False:
-            raise Exception(f"could not add task to {TaskGroup.__name__} because {task.__qualname__} was not a valid {Task.__name__}")
-        self.tasks.append(task)
 
 # --------------------------------------------------------------------------------
 
@@ -278,9 +249,6 @@ class TaskGraph:
         self._iter_depth += 1
         return self.node_at(tmp)
 
-    def _check_missing_dependencies(self, tasks: List[Task]) -> Status:
-        return Status(StatusKind.FAIL, "not implemented")
-
 # --------------------------------------------------------------------------------
 
 
@@ -298,11 +266,14 @@ class TaskExecutor:
         self.manager = Manager()
         self.graph: TaskGraph = graph
         self.outputs: dict[int, Any] = {}
+        self.progress: DictProxy = self.manager.dict({})
+        self.messages = self.manager.Queue()
         
     @staticmethod
-    def task_process(task: Task, partition_i: int, process_i: int, shared_results, resources: dict[int, Any]):
+    def task_process(task: Task, partition_i: int, process_i: int, shared_results, resources: dict[int, Any], messages: Queue):
         try:
-            result = task.execute(resources)
+            messenger = TaskMessenger(TaskIdentifier.task_hash(TaskIdentifier.get_value(task.identifier)), messages)
+            result = task.execute(messenger, resources)
             shared_results.append((partition_i, process_i, task, result))
         except Exception as error:
             shared_results.append((partition_i, process_i, task, Status(StatusKind.FAIL, str(error))))
@@ -314,7 +285,7 @@ class TaskExecutor:
             case Ok(graph):
                 return Ok(cls(graph))
             case Err(error):
-                return Err(Status(error.status, error.message))
+                return Err(Status(error.kind, error.message))
         return Err(Status(StatusKind.ERROR, "<TaskExecutor: failed to construct graph with provided tasks>"))
 
     def execute(self, max_processes: int = 1):
@@ -325,25 +296,25 @@ class TaskExecutor:
 
             for partition_i, part in enumerate(partitioned_tasks):
                 for process_i, task in enumerate(part):
-                    task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs))
+                    task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs, self.messages))
                     processes.append(task_process)
                     task_process.start()
 
-            print(INFO, f"executing {len(processes)} task{'' if len(processes) == 1 else 's'} in layer {depth} of task graph")
-
-            # while None in [p.exitcode for i, p in enumerate(processes)]:
-            #     # TODO: Report Progress
-            #     pass
-            # else:
-            for partition_i, process_i, task, result in shared_results:
-                if result.status == StatusKind.SUCCESS:
-                    if task.outputs is not None:
-                        self.outputs[task.id_as_int()] = task.outputs
-                    print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
-                elif result.status == StatusKind.FAIL:
-                    print(FAIL, result.message)
+            while None in [p.exitcode for p in processes]:
+                try:
+                    message = self.messages.get(timeout=0.1)
+                    key = message[0]
+                    progress = message[1]
+                    self.progress[key] = progress
+                except Empty as empty:
+                    pass
+                else:
+                    pass
 
             for p in processes:
                 p.join()
+
+    def tasks_progress(self) -> DictProxy:
+        return self.progress
 
 # --------------------------------------------------------------------------------
