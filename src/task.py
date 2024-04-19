@@ -2,7 +2,8 @@ from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self, Set
 from dataclasses import dataclass
 from enum import Enum
 from .logging import INFO, SUCCESS, FAIL
-from .logging import Result, StatusResult, Status
+from .logging import Status, StatusKind
+from .result import Result, Ok, Err
 from .utilities import partition
 from .resource import ForwardResourcesFrom
 from multiprocessing import Manager, Process
@@ -47,7 +48,7 @@ class TaskLog(TypedDict):
 
 @dataclass
 class Task:
-    action: Callable[..., Tuple[Any, StatusResult]]
+    action: Callable[..., Tuple[Any, Status]]
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
     dependencies: Set[TaskIdentifier | Tuple[int, str]] | None = None
@@ -56,41 +57,43 @@ class Task:
     def __post_init__(self):
         self.resolve_dependencies()
 
-    def execute(self, resources: dict[int, Any] = {}) -> StatusResult:
+    def execute(self, resources: dict[int, Any] = {}) -> Status:
         try:
-            resolved_arguments, resolved_status = self.resolve_arguments(resources).unwrap_both()
-            if resolved_status is not None:
-                return resolved_status
-            output, result = self.action(*resolved_arguments)
+            resolved_result = self.resolve_arguments(resources)
+            match resolved_result:
+                case Ok(resolved_arguments):
+                    output, result = self.action(*resolved_arguments)
+                    if result.status == StatusKind.SUCCESS and output is not None:
+                        self.outputs = output
+                    return result
+                case Err(error):
+                    return error
 
-            if result.status == Status.SUCCESS and output is not None:
-                self.outputs = output
-            return result
         except Exception as error:
-            return StatusResult(Status.FAIL, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
+            return Status(StatusKind.FAIL, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
 
-    def resolve_arguments(self, resources: dict[int, Any]) -> Result[List[Any], StatusResult]:
+    def resolve_arguments(self, resources: dict[int, Any]) -> Result[List[Any], Status]:
         all_args = [*self.args]
         resolved: List[Any] = []
         for i, a in enumerate(all_args):
             if isinstance(a, ForwardResourcesFrom):
                 task_hash = TaskIdentifier.task_hash(a.id)
                 if task_hash not in resources:
-                    return Result(None, StatusResult(Status.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(a.id)}: {TaskIdentifier.task_context(a.id)}\""))
+                    return Err(Status(StatusKind.FAIL, f"cancelled execution of task \"{self.id_with_context()}\" because required inputs were unavailable in resource pool for task \"{TaskIdentifier.task_id(a.id)}: {TaskIdentifier.task_context(a.id)}\""))
                 resolved.append(resources[task_hash])
             else:
                 resolved.append(a)
 
-        return Result(resolved, None)
+        return Ok(resolved)
 
-    def resolve_dependencies(self) -> StatusResult:
+    def resolve_dependencies(self) -> Status:
         all_args = [*self.args]
         for i, a in enumerate(all_args):
             if isinstance(a, ForwardResourcesFrom):
                 if self.dependencies is None:
                     self.dependencies = set({})
                 self.dependencies.add(a.id)
-        return StatusResult(Status.SUCCESS, "")
+        return Status(StatusKind.SUCCESS, "")
 
     def dependencies_satisified(self, completed_dependencies: List[TaskIdentifier]) -> bool:
         if self.dependencies is not None:
@@ -119,13 +122,13 @@ class Task:
 # --------------------------------------------------------------------------------
 
 def TaskExecutionWrapper(task: Task, after: Callable[..., None]):
-    def execute() -> StatusResult:
+    def execute() -> Status:
         try:
             result = task.execute()
             after(result)
             return result
         except Exception as error:
-            result = StatusResult(Status.FAIL, f"failed to execute step during {TaskGroup.__name__} execution with error: {error}")
+            result = Status(StatusKind.FAIL, f"failed to execute step during {TaskGroup.__name__} execution with error: {error}")
             after(result)
             return result
 
@@ -167,7 +170,7 @@ class TaskGraph:
         self._iter_depth = 0
 
     @classmethod
-    def from_tasks(cls, tasks: List[Task]) -> Result[Self, StatusResult]:
+    def from_tasks(cls, tasks: List[Task]) -> Result[Self, Status]:
         root = cls([])
 
         # Find independent tasks and insert at root
@@ -182,7 +185,7 @@ class TaskGraph:
                 length -= 1
             i += 1
         if len(root.tasks) == 0:
-            return Result(None, StatusResult(Status.FAIL, "<TaskGraph: no root nodes>"))
+            return Err(Status(StatusKind.FAIL, "<TaskGraph: no root nodes>"))
         else:
             try:
                 passes = 0
@@ -205,16 +208,16 @@ class TaskGraph:
                                 root.insert_at(tasks.pop(i), deepest + 1)
                                 reset = True
                             elif found > len(current_task.dependencies):
-                                return Result(None, StatusResult(Status.FAIL, "<TaskGraph excess dependencies found>"))
+                                return Err(Status(StatusKind.FAIL, "<TaskGraph excess dependencies found>"))
 
                     passes = passes + 1 if reset is False else 0
 
                 if passes > 1 or len(tasks) > 0:
-                    return Result(None, StatusResult(Status.FAIL, "<TaskGraph circular or missing dependency>"))
+                    return Err(Status(StatusKind.FAIL, "<TaskGraph circular or missing dependency>"))
             except Exception as error:
-                return Result(None, StatusResult(Status.FAIL, "<TaskGraph internal exception>"))
+                return Err(Status(StatusKind.FAIL, "<TaskGraph internal exception>"))
 
-        return Result(root, None)
+        return Ok(root)
 
     def node_at(self, depth: int = 0):
         if self.depth > depth:
@@ -265,8 +268,8 @@ class TaskGraph:
         self._iter_depth += 1
         return self.node_at(tmp)
 
-    def _check_missing_dependencies(self, tasks: List[Task]) -> StatusResult:
-        return StatusResult(Status.FAIL, "not implemented")
+    def _check_missing_dependencies(self, tasks: List[Task]) -> Status:
+        return Status(StatusKind.FAIL, "not implemented")
 
 # --------------------------------------------------------------------------------
 
@@ -274,7 +277,7 @@ class TaskGraph:
 # Task Executor Object
 # --------------------------------------------------------------------------------
 
-TaskExecutorResultEntry = Tuple[int, int, Task, StatusResult]
+TaskExecutorResultEntry = Tuple[int, int, Task, Status]
 class TaskExecutorResults(TypedDict):
     success: List[TaskExecutorResultEntry]
     failed: List[TaskExecutorResultEntry]
@@ -285,10 +288,6 @@ class TaskExecutor:
         self.manager = Manager()
         self.graph: TaskGraph = graph
         self.outputs: dict[int, Any] = {}
-        self.results: TaskExecutorResults = {
-            "success": [],
-            "failed": []
-        }
         
     @staticmethod
     def task_process(task: Task, partition_i: int, process_i: int, shared_results, resources: dict[int, Any]):
@@ -296,22 +295,23 @@ class TaskExecutor:
             result = task.execute(resources)
             shared_results.append((partition_i, process_i, task, result))
         except Exception as error:
-            shared_results.append((partition_i, process_i, task, StatusResult(Status.FAIL, str(error))))
+            shared_results.append((partition_i, process_i, task, Status(StatusKind.FAIL, str(error))))
 
     @classmethod
-    def from_tasks(cls, tasks: List[Task]) -> Result[Self, StatusResult]:
-        graph, graph_result = TaskGraph.from_tasks(tasks).unwrap_both()
-        if graph_result is not None:
-            return Result(None, StatusResult(graph_result.status, graph_result.message))
-        if graph is not None:
-            return Result(cls(graph), None)
-        return Result(None, StatusResult(Status.ERROR, "<TaskExecutor: failed to construct graph with provided tasks>"))
+    def from_tasks(cls, tasks: List[Task]) -> Result[Self, Status]:
+        graph_result = TaskGraph.from_tasks(tasks)
+        match graph_result:
+            case Ok(graph):
+                return Ok(cls(graph))
+            case Err(error):
+                return Err(Status(error.status, error.message))
+        return Err(Status(StatusKind.ERROR, "<TaskExecutor: failed to construct graph with provided tasks>"))
 
     def execute(self, max_processes: int = 1):
         for depth, node in enumerate(self.graph):
             partitioned_tasks = partition(node.tasks, max_processes)
             processes: List[Process] = []
-            shared_results: ListProxy[Tuple[int, int, Task, StatusResult]] = self.manager.list([])
+            shared_results: ListProxy[Tuple[int, int, Task, Status]] = self.manager.list([])
 
             for partition_i, part in enumerate(partitioned_tasks):
                 for process_i, task in enumerate(part):
@@ -321,31 +321,19 @@ class TaskExecutor:
 
             print(INFO, f"executing {len(processes)} task{'' if len(processes) == 1 else 's'} in layer {depth} of task graph")
 
-            while None in [p.exitcode for i, p in enumerate(processes)]:
-                # TODO: Report Progress
-                pass
-            else:
-                for partition_i, process_i, task, result in shared_results:
-                    if result.status == Status.SUCCESS:
-                        if task.outputs is not None:
-                            self.outputs[task.id_as_int()] = task.outputs
-                        print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
-                    elif result.status == Status.FAIL:
-                        print(FAIL, result.message)
+            # while None in [p.exitcode for i, p in enumerate(processes)]:
+            #     # TODO: Report Progress
+            #     pass
+            # else:
+            for partition_i, process_i, task, result in shared_results:
+                if result.status == StatusKind.SUCCESS:
+                    if task.outputs is not None:
+                        self.outputs[task.id_as_int()] = task.outputs
+                    print(SUCCESS, f"task \"{task.id_with_context()}\" completed {' with message: ' + result.message if len(result.message) > 0 else ''}")
+                elif result.status == StatusKind.FAIL:
+                    print(FAIL, result.message)
 
             for p in processes:
                 p.join()
-
-    def insert_result(self, result: TaskExecutorResultEntry):
-        if result[3].status == Status.SUCCESS:
-            self.results["success"].append(result)
-        elif result[3].status == Status.FAIL:
-            self.results["success"].append(result)
-
-    def print_result(self, depth: int, id: int, task: Task, result: StatusResult):
-        if result.status == Status.SUCCESS:
-            print(SUCCESS, f"task {task.id_with_context()} completed successfully")
-        elif result.status == Status.FAIL:
-            print(FAIL, f"task {task.id_with_context()} has failed")
 
 # --------------------------------------------------------------------------------
