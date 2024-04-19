@@ -57,7 +57,7 @@ class TaskMessenger:
 
 @dataclass
 class Task:
-    action: Callable[..., Tuple[Any, Status]]
+    action: Callable[..., Result[Any, Status]]
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
     dependencies: Set[TaskIdentifier | Tuple[int, str]] | None = None
@@ -71,10 +71,13 @@ class Task:
             resolved_result = self.resolve_arguments(resources)
             match resolved_result:
                 case Ok(resolved_arguments):
-                    output, result = self.action(messenger, *resolved_arguments)
-                    if result.kind == StatusKind.SUCCESS and output is not None:
-                        self.outputs = output
-                    return result
+                    action_result = self.action(messenger, *resolved_arguments)
+                    match action_result:
+                        case Ok(output):
+                            self.outputs = output
+                            return Status(StatusKind.SUCCESS)
+                        case Err(action_status):
+                            return action_status
                 case Err(error):
                     return error
 
