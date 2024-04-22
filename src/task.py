@@ -1,5 +1,5 @@
 from queue import Empty
-from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self, Set
+from typing import Callable, Iterator, Tuple, Any, List, TypedDict, Self, Set, Protocol
 from dataclasses import dataclass
 from enum import Enum
 from .logging import Status, StatusKind
@@ -56,9 +56,13 @@ class TaskMessenger:
 # Task Object
 # --------------------------------------------------------------------------------
 
+class TaskAction(Protocol):
+    def __call__(self, messenger: TaskMessenger, *args) -> Result[Any, Status]: ...
+
+
 @dataclass
 class Task:
-    action: Callable[[TaskMessenger, ...], Result[Any, Status]]
+    action: TaskAction
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
     dependencies: Set[TaskIdentifier | Tuple[int, str]] | None = None
