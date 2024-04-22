@@ -44,9 +44,10 @@ class TaskLog(TypedDict):
 class TaskMessenger:
     signature: int
     queue: Queue
+    title: str | None = None
 
-    def send_progress(self, progress: float) -> Status:
-        self.queue.put((self.signature, progress))
+    def send_progress(self, progress: float, message: str | None = None) -> Status:
+        self.queue.put((self.signature, self.title, message, progress))
         return Status(StatusKind.SUCCESS, "")
 
 # --------------------------------------------------------------------------------
@@ -57,7 +58,7 @@ class TaskMessenger:
 
 @dataclass
 class Task:
-    action: Callable[..., Result[Any, Status]]
+    action: Callable[[TaskMessenger, ...], Result[Any, Status]]
     identifier: TaskIdentifier | Tuple[int, str]
     args: Tuple[Any, ...] = ()
     dependencies: Set[TaskIdentifier | Tuple[int, str]] | None = None
@@ -131,6 +132,11 @@ class Task:
         if isinstance(self.identifier, tuple):
             return f"{TaskIdentifier.task_id(self.identifier)}{f': {TaskIdentifier.task_context(self.identifier)}' if TaskIdentifier.task_context(self.identifier) != '' else ''}"
         return f"{TaskIdentifier.task_id(self.identifier.value)}{f': {TaskIdentifier.task_context(self.identifier.value)}' if TaskIdentifier.task_context(self.identifier.value) != '' else ''}"
+
+    def context(self) -> str:
+        if isinstance(self.identifier, tuple):
+            return f"{TaskIdentifier.task_context(self.identifier)}"
+        return f"{TaskIdentifier.task_context(self.identifier.value)}"
 
 
 # Task Utilities
@@ -268,18 +274,23 @@ class TaskExecutor:
     def __init__(self, graph: TaskGraph):
         self.manager = Manager()
         self.graph: TaskGraph = graph
-        self.outputs: dict[int, Any] = {}
-        self.progress: DictProxy = self.manager.dict({})
+        self.outputs: DictProxy = self.manager.dict({})
         self.messages = self.manager.Queue()
+        self.results: DictProxy = self.manager.dict({})
+        self.progress: DictProxy = self.manager.dict({})
         
     @staticmethod
-    def task_process(task: Task, partition_i: int, process_i: int, shared_results, resources: dict[int, Any], messages: Queue):
+    def task_process(task: Task, results: dict[int, Any], resources: dict[int, Any], messages: Queue):
         try:
-            messenger = TaskMessenger(TaskIdentifier.task_hash(TaskIdentifier.get_value(task.identifier)), messages)
+            task_hash = task.id_as_int()
+            task_context = task.context()
+            messenger = TaskMessenger(task_hash, messages, task_context)
             result = task.execute(messenger, resources)
-            shared_results.append((partition_i, process_i, task, result))
+            results[task_hash] = result
+            if task.outputs is not None:
+                resources[task_hash] = task.outputs
         except Exception as error:
-            shared_results.append((partition_i, process_i, task, Status(StatusKind.FAIL, str(error))))
+            pass
 
     @classmethod
     def from_tasks(cls, tasks: List[Task]) -> Result[Self, Status]:
@@ -293,28 +304,31 @@ class TaskExecutor:
 
     def execute(self, max_processes: int = 1):
         for depth, node in enumerate(self.graph):
-            partitioned_tasks = partition(node.tasks, max_processes)
-            processes: List[Process] = []
-            shared_results: ListProxy[Tuple[int, int, Task, Status]] = self.manager.list([])
+            partitioned_tasks: List[List[Task]] = partition(node.tasks, max_processes)
+            processes: List[Tuple[Process, Task]] = []
 
             for partition_i, part in enumerate(partitioned_tasks):
                 for process_i, task in enumerate(part):
-                    task_process = Process(target=TaskExecutor.task_process, args=(task, partition_i, process_i, shared_results, self.outputs, self.messages))
-                    processes.append(task_process)
+                    task_process = Process(target=TaskExecutor.task_process, args=(task, self.results, self.outputs, self.messages))
+                    processes.append((task_process, task))
                     task_process.start()
 
-            while None in [p.exitcode for p in processes]:
+            while None in [p.exitcode for (p, t) in processes]:
                 try:
                     message = self.messages.get(timeout=0.1)
                     key = message[0]
-                    progress = message[1]
-                    self.progress[key] = progress
+                    title = message[1]
+                    context = message[2]
+                    progress = message[3]
+                    status = self.results[key] if key in self.results else Status(StatusKind.PENDING, "")
+                    # TODO: Concrete type for progress tuple
+                    self.progress[key] = (status, title, context, progress)
                 except Empty as empty:
                     pass
                 else:
                     pass
 
-            for p in processes:
+            for p, t in processes:
                 p.join()
 
     def tasks_progress(self) -> DictProxy:
