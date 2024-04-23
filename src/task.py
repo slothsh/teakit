@@ -289,6 +289,8 @@ class TaskExecutor:
             task_hash = task.id_as_int()
             task_context = task.context()
             messenger = TaskMessenger(task_hash, messages, task_context)
+            results[task_hash] = Status(StatusKind.PENDING)
+            messenger.send_progress(0.0) # initial progress TODO: make this not necessary
             result = task.execute(messenger, resources)
             results[task_hash] = result
             if task.outputs is not None:
