@@ -87,7 +87,7 @@ class Task:
                     return error
 
         except Exception as error:
-            return Status(StatusKind.FAIL, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
+            return Status(StatusKind.ERROR, f"failed to execute task \"{self.id_with_context()}\" during task execution with message: {error}")
 
     def resolve_arguments(self, resources: dict[int, Any]) -> Result[List[Any], Status]:
         all_args = [*self.args]
@@ -284,19 +284,26 @@ class TaskExecutor:
         self.progress: DictProxy = self.manager.dict({})
         
     @staticmethod
-    def task_process(task: Task, results: dict[int, Any], resources: dict[int, Any], messages: Queue):
+    def task_process(task: Task, results: dict[int, Any], progress: dict[int, Any], resources: dict[int, Any], messages: Queue):
+        task_hash = task.id_as_int()
+        task_context = task.context()
+
         try:
-            task_hash = task.id_as_int()
-            task_context = task.context()
             messenger = TaskMessenger(task_hash, messages, task_context)
             results[task_hash] = Status(StatusKind.PENDING)
-            messenger.send_progress(0.0) # initial progress TODO: make this not necessary
+            progress[task_hash] = (results[task_hash], task_context, "", 0.0)
+
             result = task.execute(messenger, resources)
+
             results[task_hash] = result
+            progress[task_hash] = (result, task_context, "", progress[task_hash][3])
+
             if task.outputs is not None:
                 resources[task_hash] = task.outputs
+
         except Exception as error:
-            pass
+            results[task_hash] = Status(StatusKind.ERROR, f"{str(error)}")
+            progress[task_hash] = (results[task_hash], task_context, "", 0.0)
 
     @classmethod
     def from_tasks(cls, tasks: List[Task]) -> Result[Self, Status]:
@@ -315,7 +322,7 @@ class TaskExecutor:
 
             for partition_i, part in enumerate(partitioned_tasks):
                 for process_i, task in enumerate(part):
-                    task_process = Process(target=TaskExecutor.task_process, args=(task, self.results, self.outputs, self.messages))
+                    task_process = Process(target=TaskExecutor.task_process, args=(task, self.results, self.progress, self.outputs, self.messages))
                     processes.append((task_process, task))
                     task_process.start()
 
