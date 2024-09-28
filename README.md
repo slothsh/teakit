@@ -5,6 +5,15 @@ dependency tree of tasks which can be executed in parallel.
 
 ## Usage
 
+### Import Dependencies
+
+```python
+from teakit import Task, TaskExecutor
+
+```
+
+___
+
 ### Declare Tasks
 
 Tasks are built-up procedurally, but can also be created programatically.
@@ -72,6 +81,8 @@ evolution_two_task = Task(
 )
 ```
 
+___
+
 ### Execute Tasks
 
 The above tasks, once the task graph is constructed, will have the following topology:
@@ -110,28 +121,44 @@ execution to a separate thread in your application code.
             print(error.message)
 ```
 
+___
+
 ### Task Functions
 
 `Task` functions must be defined with the interface `my_task_function(messenger: TaskMessenger, *args)`,
 and then `*args` can be dynamically unpacked in the body of `my_task_function`:
 
-**NOTE: Take care to handle errors being raised when unpacking a non-existent value in `*args`.**
-**      The order of arguments in `*args` is forwarded in the same order as specified when the `Task`**
-**      was constructed.**
+**NOTE:**
+
+**Take care to handle errors being raised when unpacking a non-existent value in `*args`.**
+
+**The order of arguments in `*args` is forwarded in the same order as specified when the `Task` was constructed.**
 
 ```python
 def my_task_function(messenger: TaskMessenger, *args):
     if len(args) != 1:
         return
 
-    pokemon: str = args[0]
+    pokemon: str = args[0] # First argument that was passed as `args` option during `Task` construction
     # ...
+
+some_task = Task(
+    identifier=(0, "Some Task"),
+    action=my_task_function,
+    args=("charmander"), # `*args` will only have one element, 'charmander' when `my_task_function` is executed
+    dependencies=None
+)
 ```
+
+___
+
+### Reporting Progress
 
 A channel for inter-process communication is provided as the first argument to each `Task`,
 which can optionally be used to report progress of execution to the `TaskExecutor`.
+Once initialized, the executor provides a method, `send_progress(progress: float, context: str)`,
 The first argument is a normalized floating-point number representing the progress,
-and the second argument is a string used as context.
+and the second argument is a string used as context for logging purposes.
 
 If a task terminates successfully, i.e. without raising an exception, and the progress
 has not been set to 1.0 during the course of the function body, then the `TaskExecutor`
